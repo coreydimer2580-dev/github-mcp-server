@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -20,9 +21,16 @@ import (
 )
 
 func granularToolsForToolset(toolsetID inventory.ToolsetID, featureFlag string) []inventory.ServerTool {
+	flag := inventory.FeatureFlag(featureFlag)
 	var result []inventory.ServerTool
 	for _, tool := range AllTools(translations.NullTranslationHelper) {
-		if tool.Toolset.ID == toolsetID && tool.FeatureFlagEnable == featureFlag {
+		features := tool.FeatureRule.Features()
+		usesFeature := false
+		for _, feature := range features {
+			usesFeature = usesFeature || feature == flag
+		}
+		if tool.Toolset.ID == toolsetID && usesFeature &&
+			tool.FeatureRule.Enabled(func(feature inventory.FeatureFlag) bool { return feature == flag }) {
 			result = append(result, tool)
 		}
 	}
@@ -101,7 +109,7 @@ func TestIssuesGranularToolset(t *testing.T) {
 
 	t.Run("all granular tools have correct feature flag", func(t *testing.T) {
 		for _, tool := range granularToolsForToolset(ToolsetMetadataIssues.ID, FeatureFlagIssuesGranular) {
-			assert.Equal(t, FeatureFlagIssuesGranular, tool.FeatureFlagEnable, "tool %s", tool.Tool.Name)
+			assert.Equal(t, []inventory.FeatureFlag{inventory.FeatureFlag(FeatureFlagIssuesGranular)}, tool.FeatureRule.Features(), "tool %s", tool.Tool.Name)
 		}
 	})
 }
@@ -137,7 +145,7 @@ func TestPullRequestsGranularToolset(t *testing.T) {
 
 	t.Run("all granular tools have correct feature flag", func(t *testing.T) {
 		for _, tool := range granularToolsForToolset(ToolsetMetadataPullRequests.ID, FeatureFlagPullRequestsGranular) {
-			assert.Equal(t, FeatureFlagPullRequestsGranular, tool.FeatureFlagEnable, "tool %s", tool.Tool.Name)
+			assert.Contains(t, tool.FeatureRule.Features(), inventory.FeatureFlag(FeatureFlagPullRequestsGranular), "tool %s", tool.Tool.Name)
 		}
 	})
 }
@@ -787,6 +795,18 @@ func TestGranularUpdateIssueType(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "remove type with null",
+			requestArgs: map[string]any{
+				"owner":        "owner",
+				"repo":         "repo",
+				"issue_number": float64(1),
+				"issue_type":   nil,
+			},
+			expectedReq: map[string]any{
+				"type": nil,
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -803,6 +823,45 @@ func TestGranularUpdateIssueType(t *testing.T) {
 			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
 			require.NoError(t, err)
 			assert.False(t, result.IsError)
+		})
+	}
+}
+
+func TestGranularUpdateIssueTypeRejectsInvalidInput(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      map[string]any
+		omitType  bool
+		wantError string
+	}{
+		{name: "missing type", omitType: true, wantError: "missing required parameter: issue_type"},
+		{name: "empty type", args: map[string]any{"issue_type": ""}, wantError: "parameter issue_type must not be empty"},
+		{name: "null with rationale", args: map[string]any{"rationale": "live validation"}, wantError: "suggestion metadata is not supported"},
+		{name: "null with confidence", args: map[string]any{"confidence": "HIGH"}, wantError: "suggestion metadata is not supported"},
+		{name: "null suggestion", args: map[string]any{"is_suggestion": true}, wantError: "suggestion metadata is not supported"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := BaseDeps{}
+			serverTool := GranularUpdateIssueType(translations.NullTranslationHelper)
+			handler := serverTool.Handler(deps)
+			args := map[string]any{
+				"owner":        "owner",
+				"repo":         "repo",
+				"issue_number": float64(1),
+				"issue_type":   nil,
+			}
+			if tc.omitType {
+				delete(args, "issue_type")
+			}
+			maps.Copy(args, tc.args)
+			request := createMCPRequest(args)
+
+			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+			require.NoError(t, err)
+			errorContent := getErrorResult(t, result)
+			assert.Contains(t, errorContent.Text, tc.wantError)
 		})
 	}
 }
@@ -1676,38 +1735,64 @@ func TestGranularAddPullRequestReviewComment(t *testing.T) {
 }
 
 func TestGranularResolveReviewThread(t *testing.T) {
-	mockedClient := githubv4mock.NewMockedHTTPClient(
-		githubv4mock.NewMutationMatcher(
-			struct {
-				ResolveReviewThread struct {
-					Thread struct {
-						ID         githubv4.ID
-						IsResolved githubv4.Boolean
-					}
-				} `graphql:"resolveReviewThread(input: $input)"`
-			}{},
-			githubv4.ResolveReviewThreadInput{
-				ThreadID: githubv4.ID("PRRT_123"),
-			},
-			nil,
-			githubv4mock.DataResponse(map[string]any{
-				"resolveReviewThread": map[string]any{
-					"thread": map[string]any{"id": "PRRT_123", "isResolved": true},
-				},
-			}),
-		),
-	)
-	gqlClient := githubv4.NewClient(mockedClient)
-	deps := BaseDeps{GQLClient: gqlClient}
-	serverTool := GranularResolveReviewThread(translations.NullTranslationHelper)
-	handler := serverTool.Handler(deps)
+	tests := []struct {
+		name                 string
+		withResolutionReason bool
+		resolutionReason     *string
+		expectedReason       *string
+	}{
+		{
+			name:                 "enabled variant forwards resolution reason",
+			withResolutionReason: true,
+			resolutionReason:     gogithub.Ptr("addressed"),
+			expectedReason:       gogithub.Ptr("addressed"),
+		},
+		{name: "default variant omits resolution reason", resolutionReason: gogithub.Ptr("addressed")},
+		{name: "without resolution reason"},
+	}
 
-	request := createMCPRequest(map[string]any{
-		"threadID": "PRRT_123",
-	})
-	result, err := handler(ContextWithDeps(context.Background(), deps), &request)
-	require.NoError(t, err)
-	assert.False(t, result.IsError)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockedClient := githubv4mock.NewMockedHTTPClient(
+				githubv4mock.NewMutationMatcher(
+					struct {
+						ResolveReviewThread struct {
+							Thread struct {
+								ID         githubv4.ID
+								IsResolved githubv4.Boolean
+							}
+						} `graphql:"resolveReviewThread(input: $input)"`
+					}{},
+					ResolveReviewThreadInput{
+						ThreadID:         githubv4.ID("PRRT_123"),
+						ResolutionReason: newGQLStringlikePtr[githubv4.String](tc.expectedReason),
+					},
+					nil,
+					githubv4mock.DataResponse(map[string]any{
+						"resolveReviewThread": map[string]any{
+							"thread": map[string]any{"id": "PRRT_123", "isResolved": true},
+						},
+					}),
+				),
+			)
+			gqlClient := githubv4.NewClient(mockedClient)
+			deps := BaseDeps{GQLClient: gqlClient}
+			serverTool := GranularResolveReviewThread(translations.NullTranslationHelper)
+			if tc.withResolutionReason {
+				serverTool = GranularResolveReviewThreadWithResolutionReason(translations.NullTranslationHelper)
+			}
+			handler := serverTool.Handler(deps)
+
+			args := map[string]any{"threadID": "PRRT_123"}
+			if tc.resolutionReason != nil {
+				args["resolutionReason"] = *tc.resolutionReason
+			}
+			request := createMCPRequest(args)
+			result, err := handler(ContextWithDeps(context.Background(), deps), &request)
+			require.NoError(t, err)
+			assert.False(t, result.IsError)
+		})
+	}
 }
 
 func TestGranularUnresolveReviewThread(t *testing.T) {
@@ -1746,6 +1831,27 @@ func TestGranularUnresolveReviewThread(t *testing.T) {
 }
 
 func TestGranularSetIssueFields(t *testing.T) {
+	t.Run("mutation selects only issue identity", func(t *testing.T) {
+		transport := &sequencedGraphQLTransport{
+			t: t,
+			responses: []func(capturedGraphQLRequest) (int, string){
+				func(req capturedGraphQLRequest) (int, string) {
+					assert.Contains(t, req.Query, "issue{id,url}")
+					assert.NotContains(t, req.Query, "issueFieldValues")
+					assert.NotContains(t, req.Query, "number")
+					return http.StatusOK, `{"data":{"setIssueFieldValue":{"issue":{"id":"ISSUE_123","url":"https://github.com/owner/repo/issues/5"}}}}`
+				},
+			},
+		}
+		_, err := SetIssueFieldValues(context.Background(), githubv4.NewClient(&http.Client{Transport: transport}), SetIssueFieldValueInput{
+			IssueID: githubv4.ID("ISSUE_123"),
+			IssueFields: []IssueFieldCreateOrUpdateInput{{
+				FieldID: githubv4.ID("FIELD_1"), TextValue: githubv4.NewString("hello"),
+			}},
+		})
+		require.NoError(t, err)
+	})
+
 	t.Run("successful set with text value", func(t *testing.T) {
 		matchers := []githubv4mock.Matcher{
 			// Mock the issue ID query
@@ -1770,29 +1876,7 @@ func TestGranularSetIssueFields(t *testing.T) {
 			),
 			// Mock the setIssueFieldValue mutation
 			githubv4mock.NewMutationMatcher(
-				struct {
-					SetIssueFieldValue struct {
-						Issue struct {
-							ID     githubv4.ID
-							Number githubv4.Int
-							URL    githubv4.String
-						}
-						IssueFieldValues []struct {
-							TextValue struct {
-								Value string
-							} `graphql:"... on IssueFieldTextValue"`
-							SingleSelectValue struct {
-								Name string
-							} `graphql:"... on IssueFieldSingleSelectValue"`
-							DateValue struct {
-								Value string
-							} `graphql:"... on IssueFieldDateValue"`
-							NumberValue struct {
-								Value float64
-							} `graphql:"... on IssueFieldNumberValue"`
-						}
-					} `graphql:"setIssueFieldValue(input: $input)"`
-				}{},
+				setIssueFieldValueMutation{},
 				SetIssueFieldValueInput{
 					IssueID: githubv4.ID("ISSUE_123"),
 					IssueFields: []IssueFieldCreateOrUpdateInput{
@@ -1806,9 +1890,8 @@ func TestGranularSetIssueFields(t *testing.T) {
 				githubv4mock.DataResponse(map[string]any{
 					"setIssueFieldValue": map[string]any{
 						"issue": map[string]any{
-							"id":     "ISSUE_123",
-							"number": 5,
-							"url":    "https://github.com/owner/repo/issues/5",
+							"id":  "ISSUE_123",
+							"url": "https://github.com/owner/repo/issues/5",
 						},
 					},
 				}),
@@ -1945,29 +2028,7 @@ func TestGranularSetIssueFields(t *testing.T) {
 				}),
 			),
 			githubv4mock.NewMutationMatcher(
-				struct {
-					SetIssueFieldValue struct {
-						Issue struct {
-							ID     githubv4.ID
-							Number githubv4.Int
-							URL    githubv4.String
-						}
-						IssueFieldValues []struct {
-							TextValue struct {
-								Value string
-							} `graphql:"... on IssueFieldTextValue"`
-							SingleSelectValue struct {
-								Name string
-							} `graphql:"... on IssueFieldSingleSelectValue"`
-							DateValue struct {
-								Value string
-							} `graphql:"... on IssueFieldDateValue"`
-							NumberValue struct {
-								Value float64
-							} `graphql:"... on IssueFieldNumberValue"`
-						}
-					} `graphql:"setIssueFieldValue(input: $input)"`
-				}{},
+				setIssueFieldValueMutation{},
 				SetIssueFieldValueInput{
 					IssueID: githubv4.ID("ISSUE_123"),
 					IssueFields: []IssueFieldCreateOrUpdateInput{
@@ -1982,9 +2043,8 @@ func TestGranularSetIssueFields(t *testing.T) {
 				githubv4mock.DataResponse(map[string]any{
 					"setIssueFieldValue": map[string]any{
 						"issue": map[string]any{
-							"id":     "ISSUE_123",
-							"number": 5,
-							"url":    "https://github.com/owner/repo/issues/5",
+							"id":  "ISSUE_123",
+							"url": "https://github.com/owner/repo/issues/5",
 						},
 					},
 				}),
@@ -2059,29 +2119,7 @@ func TestGranularSetIssueFields(t *testing.T) {
 				}),
 			),
 			githubv4mock.NewMutationMatcher(
-				struct {
-					SetIssueFieldValue struct {
-						Issue struct {
-							ID     githubv4.ID
-							Number githubv4.Int
-							URL    githubv4.String
-						}
-						IssueFieldValues []struct {
-							TextValue struct {
-								Value string
-							} `graphql:"... on IssueFieldTextValue"`
-							SingleSelectValue struct {
-								Name string
-							} `graphql:"... on IssueFieldSingleSelectValue"`
-							DateValue struct {
-								Value string
-							} `graphql:"... on IssueFieldDateValue"`
-							NumberValue struct {
-								Value float64
-							} `graphql:"... on IssueFieldNumberValue"`
-						}
-					} `graphql:"setIssueFieldValue(input: $input)"`
-				}{},
+				setIssueFieldValueMutation{},
 				SetIssueFieldValueInput{
 					IssueID: githubv4.ID("ISSUE_123"),
 					IssueFields: []IssueFieldCreateOrUpdateInput{
@@ -2096,9 +2134,8 @@ func TestGranularSetIssueFields(t *testing.T) {
 				githubv4mock.DataResponse(map[string]any{
 					"setIssueFieldValue": map[string]any{
 						"issue": map[string]any{
-							"id":     "ISSUE_123",
-							"number": 5,
-							"url":    "https://github.com/owner/repo/issues/5",
+							"id":  "ISSUE_123",
+							"url": "https://github.com/owner/repo/issues/5",
 						},
 					},
 				}),
@@ -2173,29 +2210,7 @@ func TestGranularSetIssueFields(t *testing.T) {
 				}),
 			),
 			githubv4mock.NewMutationMatcher(
-				struct {
-					SetIssueFieldValue struct {
-						Issue struct {
-							ID     githubv4.ID
-							Number githubv4.Int
-							URL    githubv4.String
-						}
-						IssueFieldValues []struct {
-							TextValue struct {
-								Value string
-							} `graphql:"... on IssueFieldTextValue"`
-							SingleSelectValue struct {
-								Name string
-							} `graphql:"... on IssueFieldSingleSelectValue"`
-							DateValue struct {
-								Value string
-							} `graphql:"... on IssueFieldDateValue"`
-							NumberValue struct {
-								Value float64
-							} `graphql:"... on IssueFieldNumberValue"`
-						}
-					} `graphql:"setIssueFieldValue(input: $input)"`
-				}{},
+				setIssueFieldValueMutation{},
 				SetIssueFieldValueInput{
 					IssueID: githubv4.ID("ISSUE_123"),
 					IssueFields: []IssueFieldCreateOrUpdateInput{
@@ -2210,9 +2225,8 @@ func TestGranularSetIssueFields(t *testing.T) {
 				githubv4mock.DataResponse(map[string]any{
 					"setIssueFieldValue": map[string]any{
 						"issue": map[string]any{
-							"id":     "ISSUE_123",
-							"number": 5,
-							"url":    "https://github.com/owner/repo/issues/5",
+							"id":  "ISSUE_123",
+							"url": "https://github.com/owner/repo/issues/5",
 						},
 					},
 				}),
@@ -2264,29 +2278,7 @@ func TestGranularSetIssueFields(t *testing.T) {
 				}),
 			),
 			githubv4mock.NewMutationMatcher(
-				struct {
-					SetIssueFieldValue struct {
-						Issue struct {
-							ID     githubv4.ID
-							Number githubv4.Int
-							URL    githubv4.String
-						}
-						IssueFieldValues []struct {
-							TextValue struct {
-								Value string
-							} `graphql:"... on IssueFieldTextValue"`
-							SingleSelectValue struct {
-								Name string
-							} `graphql:"... on IssueFieldSingleSelectValue"`
-							DateValue struct {
-								Value string
-							} `graphql:"... on IssueFieldDateValue"`
-							NumberValue struct {
-								Value float64
-							} `graphql:"... on IssueFieldNumberValue"`
-						}
-					} `graphql:"setIssueFieldValue(input: $input)"`
-				}{},
+				setIssueFieldValueMutation{},
 				SetIssueFieldValueInput{
 					IssueID: githubv4.ID("ISSUE_123"),
 					IssueFields: []IssueFieldCreateOrUpdateInput{
@@ -2302,9 +2294,8 @@ func TestGranularSetIssueFields(t *testing.T) {
 				githubv4mock.DataResponse(map[string]any{
 					"setIssueFieldValue": map[string]any{
 						"issue": map[string]any{
-							"id":     "ISSUE_123",
-							"number": 5,
-							"url":    "https://github.com/owner/repo/issues/5",
+							"id":  "ISSUE_123",
+							"url": "https://github.com/owner/repo/issues/5",
 						},
 					},
 				}),
@@ -2356,29 +2347,7 @@ func TestGranularSetIssueFields(t *testing.T) {
 				}),
 			),
 			githubv4mock.NewMutationMatcher(
-				struct {
-					SetIssueFieldValue struct {
-						Issue struct {
-							ID     githubv4.ID
-							Number githubv4.Int
-							URL    githubv4.String
-						}
-						IssueFieldValues []struct {
-							TextValue struct {
-								Value string
-							} `graphql:"... on IssueFieldTextValue"`
-							SingleSelectValue struct {
-								Name string
-							} `graphql:"... on IssueFieldSingleSelectValue"`
-							DateValue struct {
-								Value string
-							} `graphql:"... on IssueFieldDateValue"`
-							NumberValue struct {
-								Value float64
-							} `graphql:"... on IssueFieldNumberValue"`
-						}
-					} `graphql:"setIssueFieldValue(input: $input)"`
-				}{},
+				setIssueFieldValueMutation{},
 				SetIssueFieldValueInput{
 					IssueID: githubv4.ID("ISSUE_123"),
 					IssueFields: []IssueFieldCreateOrUpdateInput{
@@ -2392,9 +2361,8 @@ func TestGranularSetIssueFields(t *testing.T) {
 				githubv4mock.DataResponse(map[string]any{
 					"setIssueFieldValue": map[string]any{
 						"issue": map[string]any{
-							"id":     "ISSUE_123",
-							"number": 5,
-							"url":    "https://github.com/owner/repo/issues/5",
+							"id":  "ISSUE_123",
+							"url": "https://github.com/owner/repo/issues/5",
 						},
 					},
 				}),
